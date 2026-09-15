@@ -118,7 +118,7 @@ def parse_action(content):
     if candidate is None:
         return None
     try:
-        obj = json.loads(candidate)
+        obj = json.loads(candidate, strict=False)  # gemini puts raw newlines in strings
     except json.JSONDecodeError:
         return None
     if isinstance(obj, dict) and isinstance(obj.get("action"), str):

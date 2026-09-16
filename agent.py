@@ -10,6 +10,7 @@ as [AGENT]/[TOOL] lines to stderr. Output: report.json + report.md.
 import json
 import os
 import sys
+import time
 
 import requests
 
@@ -22,6 +23,7 @@ MAX_ITERATIONS = 10
 MAX_TOOL_CALLS = 20
 
 LLM_TIMEOUT = 120
+LLM_RETRIES = 3
 
 SYSTEM_PROMPT = """You are a research agent. You investigate the user's goal step by step.
 
@@ -61,14 +63,23 @@ def call_llm(messages):
     model = os.environ.get("TOKENROUTER_MODEL", "z-ai/glm-5.3-free")
     if not api_key:
         sys.exit("TOKENROUTER_API_KEY is not configured (set it in .env)")
-    resp = requests.post(
-        f"{base_url}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={"model": model, "messages": messages},
-        timeout=LLM_TIMEOUT,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"].get("content") or ""
+    # ponytail: 3 tries with linear backoff — the free tier throws random
+    # timeouts/503s; without this one bad call kills a whole run.
+    for attempt in range(LLM_RETRIES):
+        try:
+            resp = requests.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"model": model, "messages": messages},
+                timeout=LLM_TIMEOUT,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"].get("content") or ""
+        except requests.RequestException as e:
+            if attempt == LLM_RETRIES - 1:
+                raise
+            log(f"[AGENT] llm call failed ({e}), retrying")
+            time.sleep(5 * (attempt + 1))
 
 
 def _first_json_object(text):
@@ -107,7 +118,7 @@ def parse_action(content):
     if candidate is None:
         return None
     try:
-        obj = json.loads(candidate)
+        obj = json.loads(candidate, strict=False)  # gemini puts raw newlines in strings
     except json.JSONDecodeError:
         return None
     if isinstance(obj, dict) and isinstance(obj.get("action"), str):

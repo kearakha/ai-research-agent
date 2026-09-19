@@ -76,14 +76,14 @@ def _extract_text(html_content: str) -> str:
 
 
 def search_web(query: str) -> dict:
-    api_key = os.environ.get("BRAVE_API_KEY")
+    api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key:
-        return {"error": "BRAVE_API_KEY is not configured"}
+        return {"error": "TAVILY_API_KEY is not configured"}
     try:
-        resp = requests.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": 5},
-            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"query": query, "max_results": 5},
             timeout=SEARCH_TIMEOUT,
         )
         resp.raise_for_status()
@@ -92,9 +92,9 @@ def search_web(query: str) -> dict:
             {
                 "title": r.get("title", ""),
                 "url": r.get("url", ""),
-                "snippet": r.get("description", ""),
+                "snippet": r.get("content", ""),
             }
-            for r in data.get("web", {}).get("results", [])
+            for r in data.get("results", [])
         ]
         return {"results": results}
     except requests.exceptions.Timeout:

@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 report.json
 report.md
+memory.jsonl

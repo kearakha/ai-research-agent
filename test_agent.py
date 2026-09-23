@@ -180,6 +180,30 @@ def test_plan_subtopics_falls_back_on_llm_error():
     assert agent.plan_subtopics("original goal") == ["original goal"]
 
 
+def test_critique_parses_ok_verdict():
+    agent.call_llm = lambda messages: '{"verdict": "ok"}'
+    assert agent.critique("goal", "answer") == {"verdict": "ok"}
+
+
+def test_critique_parses_needs_more_with_gap():
+    agent.call_llm = lambda messages: '{"verdict": "needs_more", "gap": "pricing details"}'
+    result = agent.critique("goal", "answer")
+    assert result["verdict"] == "needs_more"
+    assert result["gap"] == "pricing details"
+
+
+def test_critique_defaults_to_ok_on_unparseable():
+    agent.call_llm = lambda messages: "garbage"
+    assert agent.critique("goal", "answer") == {"verdict": "ok"}
+
+
+def test_critique_defaults_to_ok_on_llm_error():
+    def boom(messages):
+        raise agent.requests.RequestException("down")
+    agent.call_llm = boom
+    assert agent.critique("goal", "answer") == {"verdict": "ok"}
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

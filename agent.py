@@ -52,6 +52,16 @@ own (a full sentence, not a single word). If the goal is already narrow, a singl
 subtopic is fine.
 """
 
+CRITIC_SYSTEM_PROMPT = """You are a critic reviewing a research answer against the \
+original goal. Reply with EXACTLY ONE JSON object and nothing else — no prose, no \
+markdown fences. One of:
+
+  {"verdict": "ok"}
+  {"verdict": "needs_more", "gap": "<what's missing, phrased as a research question>"}
+
+Say "needs_more" only for a real, specific gap in coverage — not for style preferences.
+"""
+
 
 def load_dotenv(path=".env"):
     if not os.path.exists(path):
@@ -270,6 +280,37 @@ def plan_subtopics(goal):
         return [goal]
     log(f"[PLANNER] {len(subtopics)} subtopic(s): {subtopics}")
     return subtopics
+
+
+def critique(goal, answer):
+    """One LLM call: does `answer` adequately cover `goal`? Returns
+    {"verdict": "ok"} or {"verdict": "needs_more", "gap": "..."}. Any
+    failure to get a clean verdict defaults to "ok" — a critic that can't
+    speak up shouldn't block the report."""
+    messages = [
+        {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}\n\nANSWER:\n{answer}"},
+    ]
+    try:
+        content = call_llm(messages)
+    except requests.RequestException as e:
+        log(f"[CRITIC] call failed ({e}), accepting answer as-is")
+        return {"verdict": "ok"}
+
+    candidate = _first_json_object(content.strip())
+    obj = None
+    if candidate is not None:
+        try:
+            obj = json.loads(candidate, strict=False)
+        except json.JSONDecodeError:
+            obj = None
+    if not isinstance(obj, dict) or obj.get("verdict") not in ("ok", "needs_more"):
+        log("[CRITIC] unparseable verdict, accepting answer as-is")
+        return {"verdict": "ok"}
+
+    gap = f" — {obj['gap']}" if obj.get("gap") else ""
+    log(f"[CRITIC] verdict: {obj['verdict']}{gap}")
+    return obj
 
 
 def write_reports(state):

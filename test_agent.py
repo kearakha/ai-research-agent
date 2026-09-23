@@ -158,6 +158,28 @@ def test_swayed_llm_cannot_run_off_whitelist_tools():
     assert state["stop_reason"] == "llm_done"
 
 
+def test_plan_subtopics_parses_list():
+    agent.call_llm = lambda messages: '{"subtopics": ["a", "b", "c"]}'
+    assert agent.plan_subtopics("goal") == ["a", "b", "c"]
+
+
+def test_plan_subtopics_caps_at_max():
+    agent.call_llm = lambda messages: '{"subtopics": ["a", "b", "c", "d", "e"]}'
+    assert len(agent.plan_subtopics("goal")) == agent.MAX_SUBTOPICS
+
+
+def test_plan_subtopics_falls_back_on_unparseable():
+    agent.call_llm = lambda messages: "not json"
+    assert agent.plan_subtopics("original goal") == ["original goal"]
+
+
+def test_plan_subtopics_falls_back_on_llm_error():
+    def boom(messages):
+        raise agent.requests.RequestException("down")
+    agent.call_llm = boom
+    assert agent.plan_subtopics("original goal") == ["original goal"]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

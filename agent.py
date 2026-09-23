@@ -21,6 +21,7 @@ import tools
 # search_web + read_page calls across the whole run.
 MAX_ITERATIONS = 10
 MAX_TOOL_CALLS = 20
+MAX_SUBTOPICS = 3
 
 LLM_TIMEOUT = 120
 LLM_RETRIES = 3
@@ -38,6 +39,17 @@ Rules:
 - After each action you get an "OBSERVATION" message. Use it to choose the next action.
 - If a tool returns an error, adapt: try a different query/url, or answer from your own knowledge.
 - When you have enough information, reply with "final". The answer must be detailed and cite URLs.
+"""
+
+PLANNER_SYSTEM_PROMPT = """You are a research planner. Break the user's goal into 2-4 \
+focused subtopics that together cover it well. Reply with EXACTLY ONE JSON object and \
+nothing else — no prose, no markdown fences:
+
+  {"subtopics": ["<subtopic 1>", "<subtopic 2>", ...]}
+
+Each subtopic must be a standalone research goal a researcher can investigate on its \
+own (a full sentence, not a single word). If the goal is already narrow, a single \
+subtopic is fine.
 """
 
 
@@ -223,6 +235,41 @@ def run(goal):
         f"({state['iteration']} iterations, {state['tool_call_count']} tool calls)"
     )
     return state
+
+
+def plan_subtopics(goal):
+    """One LLM call: break `goal` into up to MAX_SUBTOPICS focused subtopics.
+    Falls back to [goal] on any call/parse failure — the pipeline always has
+    at least one subtopic to research, so a flaky planner call can't sink
+    the whole run."""
+    messages = [
+        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}"},
+    ]
+    try:
+        content = call_llm(messages)
+    except requests.RequestException as e:
+        log(f"[PLANNER] call failed ({e}), researching goal as-is")
+        return [goal]
+
+    candidate = _first_json_object(content.strip())
+    obj = None
+    if candidate is not None:
+        try:
+            obj = json.loads(candidate, strict=False)
+        except json.JSONDecodeError:
+            obj = None
+    subtopics = obj.get("subtopics") if isinstance(obj, dict) else None
+    if not isinstance(subtopics, list):
+        log("[PLANNER] unparseable plan, researching goal as-is")
+        return [goal]
+
+    subtopics = [str(s).strip() for s in subtopics if str(s).strip()][:MAX_SUBTOPICS]
+    if not subtopics:
+        log("[PLANNER] empty plan, researching goal as-is")
+        return [goal]
+    log(f"[PLANNER] {len(subtopics)} subtopic(s): {subtopics}")
+    return subtopics
 
 
 def write_reports(state):

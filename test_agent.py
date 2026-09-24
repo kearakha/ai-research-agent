@@ -158,6 +158,141 @@ def test_swayed_llm_cannot_run_off_whitelist_tools():
     assert state["stop_reason"] == "llm_done"
 
 
+def test_plan_subtopics_parses_list():
+    agent.call_llm = lambda messages: '{"subtopics": ["a", "b", "c"]}'
+    assert agent.plan_subtopics("goal") == ["a", "b", "c"]
+
+
+def test_plan_subtopics_caps_at_max():
+    agent.call_llm = lambda messages: '{"subtopics": ["a", "b", "c", "d", "e"]}'
+    assert len(agent.plan_subtopics("goal")) == agent.MAX_SUBTOPICS
+
+
+def test_plan_subtopics_falls_back_on_unparseable():
+    agent.call_llm = lambda messages: "not json"
+    assert agent.plan_subtopics("original goal") == ["original goal"]
+
+
+def test_plan_subtopics_falls_back_on_llm_error():
+    def boom(messages):
+        raise agent.requests.RequestException("down")
+    agent.call_llm = boom
+    assert agent.plan_subtopics("original goal") == ["original goal"]
+
+
+def test_critique_parses_ok_verdict():
+    agent.call_llm = lambda messages: '{"verdict": "ok"}'
+    assert agent.critique("goal", "answer") == {"verdict": "ok"}
+
+
+def test_critique_parses_needs_more_with_gap():
+    agent.call_llm = lambda messages: '{"verdict": "needs_more", "gap": "pricing details"}'
+    result = agent.critique("goal", "answer")
+    assert result["verdict"] == "needs_more"
+    assert result["gap"] == "pricing details"
+
+
+def test_critique_defaults_to_ok_on_unparseable():
+    agent.call_llm = lambda messages: "garbage"
+    assert agent.critique("goal", "answer") == {"verdict": "ok"}
+
+
+def test_critique_defaults_to_ok_on_llm_error():
+    def boom(messages):
+        raise agent.requests.RequestException("down")
+    agent.call_llm = boom
+    assert agent.critique("goal", "answer") == {"verdict": "ok"}
+
+
+def test_run_pipeline_researches_each_subtopic_and_merges():
+    agent.MAX_ITERATIONS = 10
+    agent.MAX_TOOL_CALLS = 20
+    written = []
+    agent.memory.load = lambda path=agent.memory.DEFAULT_PATH: []
+    agent.memory.find_similar = lambda goal, entries, min_overlap=0.3: None
+    agent.memory.append = lambda entry, path=agent.memory.DEFAULT_PATH: written.append(entry)
+
+    def fake_llm(messages):
+        system = messages[0]["content"]
+        if system == agent.PLANNER_SYSTEM_PROMPT:
+            return '{"subtopics": ["topic A", "topic B"]}'
+        if system == agent.CRITIC_SYSTEM_PROMPT:
+            return '{"verdict": "ok"}'
+        goal_line = messages[1]["content"]  # "GOAL: topic A" / "GOAL: topic B"
+        return json.dumps({"action": "final", "answer": f"researched: {goal_line}"})
+
+    agent.call_llm = fake_llm
+    agent.tools.execute_tool = lambda name, args: {"results": []}
+
+    state = agent.run_pipeline("original goal")
+
+    assert state["subtopics"] == ["topic A", "topic B"]
+    assert state["critic_verdict"] == "ok"
+    assert state["stop_reason"] == "pipeline_done"
+    assert "topic A" in state["answer"] and "topic B" in state["answer"]
+    assert len(written) == 1 and written[0]["goal"] == "original goal"
+
+
+def test_run_pipeline_does_one_extra_round_when_critic_flags_gap():
+    agent.MAX_ITERATIONS = 10
+    agent.MAX_TOOL_CALLS = 20
+    agent.memory.load = lambda path=agent.memory.DEFAULT_PATH: []
+    agent.memory.find_similar = lambda goal, entries, min_overlap=0.3: None
+    agent.memory.append = lambda entry, path=agent.memory.DEFAULT_PATH: None
+
+    critic_calls = []
+
+    def fake_llm(messages):
+        system = messages[0]["content"]
+        if system == agent.PLANNER_SYSTEM_PROMPT:
+            return '{"subtopics": ["topic A"]}'
+        if system == agent.CRITIC_SYSTEM_PROMPT:
+            critic_calls.append(1)
+            if len(critic_calls) == 1:
+                return '{"verdict": "needs_more", "gap": "missing pricing"}'
+            return '{"verdict": "ok"}'
+        goal_line = messages[1]["content"]
+        return json.dumps({"action": "final", "answer": f"researched: {goal_line}"})
+
+    agent.call_llm = fake_llm
+    agent.tools.execute_tool = lambda name, args: {"results": []}
+
+    state = agent.run_pipeline("original goal")
+
+    # capped at exactly one extra round, not looped until "ok"
+    assert len(critic_calls) == 2
+    assert "missing pricing" in state["answer"]
+    assert state["critic_verdict"] == "ok"
+
+
+def test_run_pipeline_injects_prior_context_on_memory_hit():
+    agent.MAX_ITERATIONS = 10
+    agent.MAX_TOOL_CALLS = 20
+    past_entry = {"goal": "past goal", "answer": "past answer", "ts": "2026-01-01T00:00:00+00:00"}
+    agent.memory.load = lambda path=agent.memory.DEFAULT_PATH: [past_entry]
+    agent.memory.find_similar = lambda goal, entries, min_overlap=0.3: entries[0]
+    agent.memory.append = lambda entry, path=agent.memory.DEFAULT_PATH: None
+
+    captured = {}
+
+    def fake_llm(messages):
+        system = messages[0]["content"]
+        if system == agent.PLANNER_SYSTEM_PROMPT:
+            return '{"subtopics": ["topic A"]}'
+        if system == agent.CRITIC_SYSTEM_PROMPT:
+            return '{"verdict": "ok"}'
+        captured["goal_line"] = messages[1]["content"]
+        return '{"action": "final", "answer": "ok"}'
+
+    agent.call_llm = fake_llm
+    agent.tools.execute_tool = lambda name, args: {"results": []}
+
+    state = agent.run_pipeline("original goal")
+
+    assert "past answer" in captured["goal_line"]
+    assert state["memory_hit"] == "2026-01-01T00:00:00+00:00"
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

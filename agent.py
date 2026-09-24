@@ -11,9 +11,11 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 
 import requests
 
+import memory
 import tools
 
 # Tunable knobs — raise if the agent stops before it has enough, lower if it
@@ -21,6 +23,7 @@ import tools
 # search_web + read_page calls across the whole run.
 MAX_ITERATIONS = 10
 MAX_TOOL_CALLS = 20
+MAX_SUBTOPICS = 3
 
 LLM_TIMEOUT = 120
 LLM_RETRIES = 3
@@ -38,6 +41,27 @@ Rules:
 - After each action you get an "OBSERVATION" message. Use it to choose the next action.
 - If a tool returns an error, adapt: try a different query/url, or answer from your own knowledge.
 - When you have enough information, reply with "final". The answer must be detailed and cite URLs.
+"""
+
+PLANNER_SYSTEM_PROMPT = """You are a research planner. Break the user's goal into 2-4 \
+focused subtopics that together cover it well. Reply with EXACTLY ONE JSON object and \
+nothing else — no prose, no markdown fences:
+
+  {"subtopics": ["<subtopic 1>", "<subtopic 2>", ...]}
+
+Each subtopic must be a standalone research goal a researcher can investigate on its \
+own (a full sentence, not a single word). If the goal is already narrow, a single \
+subtopic is fine.
+"""
+
+CRITIC_SYSTEM_PROMPT = """You are a critic reviewing a research answer against the \
+original goal. Reply with EXACTLY ONE JSON object and nothing else — no prose, no \
+markdown fences. One of:
+
+  {"verdict": "ok"}
+  {"verdict": "needs_more", "gap": "<what's missing, phrased as a research question>"}
+
+Say "needs_more" only for a real, specific gap in coverage — not for style preferences.
 """
 
 
@@ -225,6 +249,145 @@ def run(goal):
     return state
 
 
+def plan_subtopics(goal):
+    """One LLM call: break `goal` into up to MAX_SUBTOPICS focused subtopics.
+    Falls back to [goal] on any call/parse failure — the pipeline always has
+    at least one subtopic to research, so a flaky planner call can't sink
+    the whole run."""
+    messages = [
+        {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}"},
+    ]
+    try:
+        content = call_llm(messages)
+    except requests.RequestException as e:
+        log(f"[PLANNER] call failed ({e}), researching goal as-is")
+        return [goal]
+
+    candidate = _first_json_object(content.strip())
+    obj = None
+    if candidate is not None:
+        try:
+            obj = json.loads(candidate, strict=False)
+        except json.JSONDecodeError:
+            obj = None
+    subtopics = obj.get("subtopics") if isinstance(obj, dict) else None
+    if not isinstance(subtopics, list):
+        log("[PLANNER] unparseable plan, researching goal as-is")
+        return [goal]
+
+    subtopics = [str(s).strip() for s in subtopics if str(s).strip()][:MAX_SUBTOPICS]
+    if not subtopics:
+        log("[PLANNER] empty plan, researching goal as-is")
+        return [goal]
+    log(f"[PLANNER] {len(subtopics)} subtopic(s): {subtopics}")
+    return subtopics
+
+
+def critique(goal, answer):
+    """One LLM call: does `answer` adequately cover `goal`? Returns
+    {"verdict": "ok"} or {"verdict": "needs_more", "gap": "..."}. Any
+    failure to get a clean verdict defaults to "ok" — a critic that can't
+    speak up shouldn't block the report."""
+    messages = [
+        {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
+        {"role": "user", "content": f"GOAL: {goal}\n\nANSWER:\n{answer}"},
+    ]
+    try:
+        content = call_llm(messages)
+    except requests.RequestException as e:
+        log(f"[CRITIC] call failed ({e}), accepting answer as-is")
+        return {"verdict": "ok"}
+
+    candidate = _first_json_object(content.strip())
+    obj = None
+    if candidate is not None:
+        try:
+            obj = json.loads(candidate, strict=False)
+        except json.JSONDecodeError:
+            obj = None
+    if not isinstance(obj, dict) or obj.get("verdict") not in ("ok", "needs_more"):
+        log("[CRITIC] unparseable verdict, accepting answer as-is")
+        return {"verdict": "ok"}
+
+    gap = f" — {obj['gap']}" if obj.get("gap") else ""
+    log(f"[CRITIC] verdict: {obj['verdict']}{gap}")
+    return obj
+
+
+def _merge_sections(states, labels):
+    return "\n\n---\n\n".join(
+        f"### {label}\n\n{s['answer']}" for label, s in zip(labels, states)
+    )
+
+
+def run_pipeline(goal):
+    """Planner -> Researcher (per subtopic, existing `run()` loop, unchanged)
+    -> merge -> Critic -> at most one extra research round for a flagged
+    gap -> memory. Reuses `run()` as-is so the tested single-topic loop
+    stays the unit of work; this just orchestrates it."""
+    log("[MEMORY] checking for similar past runs")
+    past = memory.find_similar(goal, memory.load())
+    prior_context = None
+    if past:
+        log(f"[MEMORY] found similar run from {past.get('ts', '?')}")
+        prior_context = (past.get("answer") or "")[:1000]
+
+    subtopics = plan_subtopics(goal)
+    labels = list(subtopics)
+    sub_states = []
+    for i, subtopic in enumerate(subtopics, 1):
+        log(f"[RESEARCHER] subtopic {i}/{len(subtopics)}: {subtopic}")
+        sub_goal = subtopic
+        if prior_context and i == 1:
+            sub_goal = (
+                f"{subtopic}\n\n(Context from a past related run — use as a "
+                f"reference, but verify it: {prior_context})"
+            )
+        sub_states.append(run(sub_goal))
+
+    merged_answer = _merge_sections(sub_states, labels)
+    verdict = critique(goal, merged_answer)
+
+    if verdict["verdict"] == "needs_more" and verdict.get("gap"):
+        gap = verdict["gap"]
+        log(f"[RESEARCHER] one more round for gap: {gap}")
+        sub_states.append(run(gap))
+        labels.append(gap)
+        merged_answer = _merge_sections(sub_states, labels)
+        verdict = critique(goal, merged_answer)  # capped at 1 extra round, not looped further
+
+    merged_sources = list(dict.fromkeys(url for s in sub_states for url in s["sources"]))
+    pipeline_state = {
+        "goal": goal,
+        "subtopics": subtopics,
+        "answer": merged_answer,
+        "sources": merged_sources,
+        "stop_reason": "pipeline_done",
+        "iteration": sum(s["iteration"] for s in sub_states),
+        "tool_call_count": sum(s["tool_call_count"] for s in sub_states),
+        "critic_verdict": verdict["verdict"],
+        "memory_hit": past.get("ts") if past else None,
+        "findings": [f for s in sub_states for f in s["findings"]],
+    }
+
+    memory.append({
+        "goal": goal,
+        "answer": merged_answer,
+        "sources": merged_sources,
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+    log("[MEMORY] appended run to memory.jsonl")
+
+    log(
+        f"[AGENT] pipeline done: {len(subtopics)} subtopic(s), "
+        f"{pipeline_state['iteration']} total iterations, "
+        f"{pipeline_state['tool_call_count']} total tool calls, "
+        f"critic={pipeline_state['critic_verdict']}"
+    )
+    return pipeline_state
+
+
 def write_reports(state):
     report = {
         "goal": state["goal"],
@@ -235,12 +398,20 @@ def write_reports(state):
         "answer": state["answer"],
         "findings": state["findings"],
     }
+    # optional: only present when state came from run_pipeline(), not the
+    # plain single-topic run()
+    for key in ("subtopics", "critic_verdict", "memory_hit"):
+        if key in state:
+            report[key] = state[key]
     with open("report.json", "w") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    lines = [
-        f"# {state['goal']}",
-        "",
+    lines = [f"# {state['goal']}", ""]
+    if state.get("subtopics"):
+        lines += ["## Subtopics", ""]
+        lines += [f"- {s}" for s in state["subtopics"]]
+        lines += [""]
+    lines += [
         state["answer"] or "_(no answer produced)_",
         "",
         "## Sources",
@@ -254,8 +425,12 @@ def write_reports(state):
         f"- stop reason: {state['stop_reason']}",
         f"- iterations: {state['iteration']}",
         f"- tool calls: {state['tool_call_count']}",
-        "",
     ]
+    if "critic_verdict" in state:
+        lines.append(f"- critic verdict: {state['critic_verdict']}")
+    if state.get("memory_hit"):
+        lines.append(f"- memory: reused context from a past run at {state['memory_hit']}")
+    lines.append("")
     with open("report.md", "w") as f:
         f.write("\n".join(lines))
 
@@ -265,7 +440,7 @@ def main():
     if not goal:
         sys.exit('usage: python agent.py "your research goal"')
     load_dotenv()
-    state = run(goal)
+    state = run_pipeline(goal)
     write_reports(state)
     log("[AGENT] wrote report.json + report.md")
 

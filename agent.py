@@ -334,7 +334,7 @@ def run_pipeline(goal):
         prior_context = (past.get("answer") or "")[:1000]
 
     subtopics = plan_subtopics(goal)
-    labels = list(subtopics)
+    labels = []
     sub_states = []
     for i, subtopic in enumerate(subtopics, 1):
         log(f"[RESEARCHER] subtopic {i}/{len(subtopics)}: {subtopic}")
@@ -344,7 +344,27 @@ def run_pipeline(goal):
                 f"{subtopic}\n\n(Context from a past related run — use as a "
                 f"reference, but verify it: {prior_context})"
             )
-        sub_states.append(run(sub_goal))
+        try:
+            sub_states.append(run(sub_goal))
+            labels.append(subtopic)
+        except requests.RequestException as e:
+            # one subtopic's LLM calls exhausted retries — don't let it sink
+            # the subtopics that already succeeded.
+            log(f"[RESEARCHER] subtopic {i} failed ({e}), skipping")
+
+    if not sub_states:
+        log("[AGENT] pipeline failed: every subtopic failed")
+        return {
+            "goal": goal,
+            "subtopics": subtopics,
+            "answer": "",
+            "sources": [],
+            "stop_reason": "pipeline_failed",
+            "iteration": 0,
+            "tool_call_count": 0,
+            "memory_hit": past.get("ts") if past else None,
+            "findings": [],
+        }
 
     merged_answer = _merge_sections(sub_states, labels)
     verdict = critique(goal, merged_answer)

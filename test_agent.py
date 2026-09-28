@@ -293,6 +293,61 @@ def test_run_pipeline_injects_prior_context_on_memory_hit():
     assert state["memory_hit"] == "2026-01-01T00:00:00+00:00"
 
 
+def test_run_pipeline_skips_subtopic_whose_llm_calls_all_fail():
+    agent.MAX_ITERATIONS = 10
+    agent.MAX_TOOL_CALLS = 20
+    agent.memory.load = lambda path=agent.memory.DEFAULT_PATH: []
+    agent.memory.find_similar = lambda goal, entries, min_overlap=0.3: None
+    written = []
+    agent.memory.append = lambda entry, path=agent.memory.DEFAULT_PATH: written.append(entry)
+
+    def fake_llm(messages):
+        system = messages[0]["content"]
+        if system == agent.PLANNER_SYSTEM_PROMPT:
+            return '{"subtopics": ["topic A", "topic B"]}'
+        if system == agent.CRITIC_SYSTEM_PROMPT:
+            return '{"verdict": "ok"}'
+        goal_line = messages[1]["content"]
+        if "topic B" in goal_line:
+            raise agent.requests.RequestException("down")
+        return json.dumps({"action": "final", "answer": f"researched: {goal_line}"})
+
+    agent.call_llm = fake_llm
+    agent.tools.execute_tool = lambda name, args: {"results": []}
+
+    state = agent.run_pipeline("original goal")
+
+    # subtopic B failed and was skipped; subtopic A's work is not lost
+    assert state["stop_reason"] == "pipeline_done"
+    assert "researched: GOAL: topic A" in state["answer"]
+    assert "researched: GOAL: topic B" not in state["answer"]
+    assert len(written) == 1
+
+
+def test_run_pipeline_fails_when_every_subtopic_fails():
+    agent.MAX_ITERATIONS = 10
+    agent.MAX_TOOL_CALLS = 20
+    agent.memory.load = lambda path=agent.memory.DEFAULT_PATH: []
+    agent.memory.find_similar = lambda goal, entries, min_overlap=0.3: None
+    written = []
+    agent.memory.append = lambda entry, path=agent.memory.DEFAULT_PATH: written.append(entry)
+
+    def fake_llm(messages):
+        system = messages[0]["content"]
+        if system == agent.PLANNER_SYSTEM_PROMPT:
+            return '{"subtopics": ["topic A"]}'
+        raise agent.requests.RequestException("down")
+
+    agent.call_llm = fake_llm
+    agent.tools.execute_tool = lambda name, args: {"results": []}
+
+    state = agent.run_pipeline("original goal")
+
+    assert state["stop_reason"] == "pipeline_failed"
+    assert state["answer"] == ""
+    assert written == []
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
